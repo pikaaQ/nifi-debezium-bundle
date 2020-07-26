@@ -1,0 +1,7 @@
+# Project exclude paths
+/nifi-debezium-nar/target/
+/nifi-debezium-processors/target/
+/target/
+
+.idea
+*.iml
