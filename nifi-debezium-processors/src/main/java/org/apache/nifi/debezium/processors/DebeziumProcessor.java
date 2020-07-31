@@ -3,18 +3,19 @@ package org.apache.nifi.debezium.processors;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import io.debezium.engine.ChangeEvent;
 import io.debezium.engine.DebeziumEngine;
-import io.debezium.engine.RecordChangeEvent;
 import io.debezium.engine.format.CloudEvents;
-import org.apache.kafka.connect.storage.OffsetBackingStore;
 import org.apache.nifi.annotation.behavior.InputRequirement;
 import org.apache.nifi.annotation.behavior.Stateful;
 import org.apache.nifi.annotation.behavior.TriggerSerially;
 import org.apache.nifi.annotation.documentation.CapabilityDescription;
 import org.apache.nifi.annotation.documentation.Tags;
+import org.apache.nifi.annotation.lifecycle.OnShutdown;
+import org.apache.nifi.annotation.lifecycle.OnStopped;
 import org.apache.nifi.components.PropertyDescriptor;
 import org.apache.nifi.components.state.Scope;
 import org.apache.nifi.components.state.StateManager;
 import org.apache.nifi.components.state.StateMap;
+import org.apache.nifi.debezium.offset.storage.StaticMapOffsetStore;
 import org.apache.nifi.expression.ExpressionLanguageScope;
 import org.apache.nifi.flowfile.FlowFile;
 import org.apache.nifi.logging.ComponentLog;
@@ -126,72 +127,63 @@ public class DebeziumProcessor extends AbstractSessionFactoryProcessor {
     private ExecutorService executor  = Executors.newSingleThreadExecutor();
     private DebeziumEngine<ChangeEvent<String, String>> debeziumEngine;
     private volatile ProcessSession currentSession;
-    private volatile boolean enginRunning = false;
     private String topic;
 
     public void setup(ProcessContext context) throws IOException {
-        // Create a debeziumEngine if we don't have one
-        if (debeziumEngine == null) {
-            Properties properties = new Properties();
-            properties.putAll(context.getAllProperties());
 
-            String extJson = properties.remove(EXT_JSON.getName()).toString();
-            try {
-                properties.putAll(new ObjectMapper().readValue(extJson, HashMap.class));
-            } catch (IOException e) {
-                logger.error("extension properties not a legal json map: " + e.getMessage());
-            }
+        Properties properties = new Properties();
+        properties.putAll(context.getAllProperties());
 
-            properties.setProperty("offset.storage", "org.apache.nifi.debezium.processors.OffsetPointer");
+        String extJson = properties.remove(EXT_JSON.getName()).toString();
+        try {
+            properties.putAll(new ObjectMapper().readValue(extJson, HashMap.class));
+        } catch (IOException e) {
+            logger.error("extension properties not a legal json map: " + e.getMessage());
+        }
 
-            logger.info("debezium engine create: {}", properties.toString());
+        properties.setProperty("offset.storage", "org.apache.nifi.debezium.offset.storage.StaticMapOffsetStore");
 
-            debeziumEngine = DebeziumEngine.create(CloudEvents.class)
-                            .using(properties)
-                            .using(new DebeziumEngine.ConnectorCallback() {
-                                @Override
-                                public void connectorStarted() {
+        logger.info("debezium engine create: {}", properties.toString());
 
+        debeziumEngine = DebeziumEngine.create(CloudEvents.class)
+                        .using(properties)
+                        .using(new DebeziumEngine.ConnectorCallback() {
+                            @Override
+                            public void connectorStopped() {
+                                logger.warn("debezium engine connector stopped.");
+                                stop(context);
+                            }
+                        })
+                        .using((success, message, error) -> {
+                            if(error != null){
+                                logger.warn("debezium engine stop by error: " + error.getMessage());
+                            }
+                        })
+                        .notifying((records, committer) -> {
+                            try{
+                                for(ChangeEvent<String, String> record : records){
+                                    sendOneRecord(record);
+                                    committer.markProcessed(record);
                                 }
-
-                                @Override
-                                public void connectorStopped() {
-                                    try {
-                                        logger.warn("debezium engine connector stopped.");
-                                        debeziumEngine.close();
-                                        enginRunning = false;
-                                    } catch (IOException e) {
-                                        logger.error("debezium egine connector stopping error: " + e.getMessage());
-                                        logger.debug("debezium egine connector stopping error: ", e);
-                                    }
-                                }
-                            })
-                            .using((success, message, error) -> {
-                                try {
-                                    if(error != null){
-                                        logger.error("debezium engine stop by error: " + error.getMessage());
-                                    }else{
-                                        logger.info("debezium engine stop by complete.");
-                                    }
-                                    debeziumEngine.close();
-                                    enginRunning = false;
-                                } catch (IOException e) {
-                                    logger.error("debezium egine stopping error: " + e.getMessage());
-                                    logger.debug("debezium egine stopping error: ", e);
-                                }
-                            })
-                            .notifying(record -> {
-                                Object value = ((RecordChangeEvent) record).record();
-                                logger.info("notifying: "+ value);
-                                FlowFile flowFile = currentSession.create();
-                                flowFile = currentSession.write(flowFile, outputStream -> {
-                                    outputStream.write(value.toString().getBytes());
-                                    outputStream.flush();
-                                });
-                                currentSession.transfer(flowFile, REL_SUCCESS);
-                                currentSession.getProvenanceReporter().receive(flowFile, "<unknown>");
+                                committer.markBatchFinished();
                                 currentSession.commit();
-                            }).build();
+                            }catch (Exception e){
+                                currentSession.rollback();
+                            }
+                        }).build();
+    }
+
+    private void sendOneRecord(ChangeEvent<String, String> record){
+        Object value = record.value();
+        if(value != null){
+            logger.info("notifying: "+ record);
+            FlowFile flowFile = currentSession.create();
+            flowFile = currentSession.write(flowFile, outputStream -> {
+                outputStream.write(value.toString().getBytes());
+                outputStream.flush();
+            });
+            currentSession.transfer(flowFile, REL_SUCCESS);
+            currentSession.getProvenanceReporter().receive(flowFile, "<unknown>");
         }
     }
 
@@ -199,59 +191,82 @@ public class DebeziumProcessor extends AbstractSessionFactoryProcessor {
         if (currentSession == null) {
             currentSession = sessionFactory.createSession();
         }
-        if(!enginRunning){
-            executor.execute(debeziumEngine);
-            enginRunning = true;
+
+        executor.execute(debeziumEngine);
+    }
+
+    private void stop(ProcessContext context) {
+        if(debeziumEngine != null){
+            try {
+                debeziumEngine.close();
+                saveOffset(context);
+                debeziumEngine = null;
+            } catch (IOException e) {
+                logger.error("fail to stop debeziumEngine: ", e);
+                throw new ProcessException(e);
+            }
         }
+
     }
 
-    private void stop() throws IOException {
-        debeziumEngine.close();
-        enginRunning = false;
-    }
-
-    // Synchronize the offset. See OffsetPointer, I use a static ConcurrentHashMap to store the offset.
-    // TODO: If in a cluster, maybe it should change to redis.
+    // Synchronize the offset. See StaticMapOffsetStore, I use a static ConcurrentHashMap to store the offset.
     private void setOffset(ProcessContext context) throws IOException {
         topic = context.getProperty("offset.storage.topic").getValue();
         StateManager stateManager = context.getStateManager();
         StateMap curStateMap = stateManager.getState(Scope.CLUSTER);
-        OffsetPointer.setTopicPointer(topic, curStateMap.toMap());
+        StaticMapOffsetStore.setTopicOffset(topic, curStateMap.toMap());
     }
 
     private void saveOffset(ProcessContext context) throws IOException {
         topic = context.getProperty("offset.storage.topic").getValue();
         StateManager stateManager = context.getStateManager();
-        stateManager.setState(OffsetPointer.getTopicPointer(topic), Scope.CLUSTER);
+        stateManager.setState(StaticMapOffsetStore.getTopicOffset(topic), Scope.CLUSTER);
     }
 
     @Override
     public void onTrigger(ProcessContext context, ProcessSessionFactory sessionFactory) throws ProcessException {
         ComponentLog log = this.getLogger();
-        try{
-            setup(context);
-        }catch (IOException e){
-            log.error("fail to setup debezium: ", e);
-        }
-        try {
-            setOffset(context);
-        } catch (IOException e) {
-            log.error("fail to get last offset: ", e);
+
+        // Create a debeziumEngine if we don't have one
+        if (debeziumEngine == null) {
+            try {
+                setup(context);
+            } catch (IOException e) {
+                log.error("fail to setup debezium: " + e.getMessage());
+                logger.error("fail to setup debezium: ", e);
+                context.yield();
+                return;
+            }
+
+            try {
+                setOffset(context);
+            } catch (IOException e) {
+                log.error("fail to setup offset: " + e.getMessage());
+                logger.error("fail to setup offset: ", e);
+                context.yield();
+                return;
+            }
+
+            run(sessionFactory);
         }
 
-        run(sessionFactory);
-//        try {
-//            stop();
-//        } catch (IOException e) {
-//            log.error("fail when stopping the debezium egine: ", e);
-//        }
         try {
             saveOffset(context);
         } catch (IOException e) {
-            log.error("fail to save offset: ", e);
+            log.error("fail to flush offset: ", e);
+            logger.error("fail to flush offset: ", e);
         }
     }
 
+    @OnStopped
+    public void onStopped(ProcessContext context) {
+        stop(context);
+    }
+
+    @OnShutdown
+    public void onShutdown(ProcessContext context) {
+        stop(context);
+    }
 
     @Override
     protected List<PropertyDescriptor> getSupportedPropertyDescriptors() {
